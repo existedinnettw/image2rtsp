@@ -38,3 +38,15 @@
                                  # False = rtsp://0.0.0.0:portAndMountpoint (The stream is accessible from the outside) 
                                  # For example, to access the stream running on the machine with IP = 192.168.20.20,
                                  # use rtsp://192.168.20.20:portAndMountpoint
+
+      # Several streams in one process: list their names, and give each the parameters above
+      # under its name; what a stream leaves out it takes from the top-level parameters.
+      # Streams on one port share an RTSP server: different mountpoints, same local_only.
+      # streams:          ["front", "back"]
+      # front:
+      #    topic:         "/front/image_raw"
+      #    mountpoint:    "/front"
+      # back:
+      #    topic:         "/back/image_raw"
+      #    mountpoint:    "/back"
+      #    port:          "8555"

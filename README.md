@@ -82,6 +82,31 @@ sudo apt-get install libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1
                                  # For example, to access the stream running on the machine with IP = 192.168.20.20,
                                  # use rtsp://192.168.20.20:portAndMountpoint
 
+  - To serve several topics or cameras from one process, list them in `streams`. Each stream is
+    configured by the parameters above prefixed with its name, which default to the top-level ones.
+    One process costs far less memory than one per stream: most of it is the ROS node and GStreamer,
+    not the frames. Streams on different ports get one RTSP server each; streams on the same port
+    share one, so they need different mountpoints and the same `local_only`.
+      ```yaml
+      /image2rtsp:
+         ros__parameters:
+            local_only:       False      # the default of every stream, like default_pipeline etc.
+            streams:          ["front", "back"]
+            front:
+               topic:         "/front/image_raw"
+               mountpoint:    "/front"
+               port:          "8554"
+            back:
+               topic:         "/back/image_raw/compressed"
+               compressed:    True
+               mountpoint:    "/back"
+               port:          "8555"
+               default_pipeline: |
+                              ( appsrc name=imagesrc ... ! rtph264pay name=pay0 pt=96 )
+      ```
+      Each stream's log lines are tagged with its name (`image2rtsp.front`). With more than one stream
+      the node spins one thread per stream, so a slow stream (e.g. JPEG decoding) does not hold up the others.
+
   - Save your configuration and navigate to `ros2_ws` colcon root, source and build the package:
       ```bashrc
       cd ~/ros2_ws/

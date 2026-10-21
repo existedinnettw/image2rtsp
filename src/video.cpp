@@ -19,19 +19,29 @@ void Image2rtsp::video_mainloop_start(){
 }
 
 Image2rtsp::~Image2rtsp(){
-    /* close every client connection, stop the GStreamer main loop and release the server */
-    GList *clients = gst_rtsp_server_client_filter(rtsp_server,
-        [](GstRTSPServer *, GstRTSPClient *, gpointer){ return GST_RTSP_FILTER_REMOVE; }, nullptr);
-    g_list_free_full(clients, g_object_unref);
+    /* close every client connection, stop the GStreamer main loop and release the servers */
+    for (auto &entry : servers){
+        GList *clients = gst_rtsp_server_client_filter(entry.second.server,
+            [](GstRTSPServer *, GstRTSPClient *, gpointer){ return GST_RTSP_FILTER_REMOVE; }, nullptr);
+        g_list_free_full(clients, g_object_unref);
+    }
     if (main_loop){
         g_main_loop_quit(main_loop);
         main_loop_thread.join();
     }
     if (cleanup_source_id) g_source_remove(cleanup_source_id);
-    if (server_source_id) g_source_remove(server_source_id);
-    g_object_unref(rtsp_server);
+    for (auto &entry : servers){
+        if (entry.second.source_id) g_source_remove(entry.second.source_id);
+        g_object_unref(entry.second.server);
+    }
+    servers.clear();
     if (main_loop) g_main_loop_unref(main_loop);
 
+    /* only now, with the main loop stopped, can no media callback reach a stream */
+    streams.clear();
+}
+
+Stream::~Stream(){
     /* media that never got to emit "unprepared" still holds appsrc references in the list */
     std::lock_guard<std::mutex> lock(appsrc_mutex);
     for (GstAppSrc *appsrc : appsrc_list) gst_object_unref(appsrc);
@@ -39,57 +49,60 @@ Image2rtsp::~Image2rtsp(){
     if (caps) gst_caps_unref(caps);
 }
 
-GstRTSPServer *Image2rtsp::rtsp_server_create(const std::string &port, bool local_only){
+/* The server on `port`, created on first use: streams on the same port share it. */
+GstRTSPServer *Image2rtsp::rtsp_server_for(const std::string &port, bool local_only){
+    auto existing = servers.find(port);
+    if (existing != servers.end()) return existing->second.server;
+
     GstRTSPServer *server = gst_rtsp_server_new();
     g_object_set(server, "service", port.c_str(), NULL);
     if (local_only){
         g_object_set(server, "address", "127.0.0.1", NULL);
     }
     /* attach the server to the default main context, which the main loop thread will run */
-    server_source_id = gst_rtsp_server_attach(server, NULL);
-    if (server_source_id == 0){
+    guint source_id = gst_rtsp_server_attach(server, NULL);
+    if (source_id == 0){
         gchar *address = gst_rtsp_server_get_address(server);
         std::string msg = "Could not bind the RTSP server to " + std::string(address) + ":" + port + " (is the port already in use?)";
         g_free(address);
         g_object_unref(server);
         throw std::runtime_error(msg);
     }
-    /* periodically remove expired sessions */
-    cleanup_source_id = g_timeout_add_seconds(2, session_cleanup, this);
+    servers[port] = Server{server, source_id, local_only};
     return server;
 }
 
-void Image2rtsp::rtsp_server_add_url(const char *url, const char *sPipeline){
+void Image2rtsp::rtsp_server_add_url(GstRTSPServer *server, Stream &stream){
     GstRTSPMountPoints *mounts;
     GstRTSPMediaFactory *factory;
 
     /* get the mount points for this server, every server has a default object
      * that be used to map uri mount points to media factories */
-    mounts = gst_rtsp_server_get_mount_points(rtsp_server);
+    mounts = gst_rtsp_server_get_mount_points(server);
 
     /* make a media factory for a test stream. The default media factory can use
      * gst-launch syntax to create pipelines.
      * any launch line works as long as it contains elements named pay%d. Each
      * element with pay%d names will be a stream */
     factory = gst_rtsp_media_factory_new();
-    gst_rtsp_media_factory_set_launch(factory, sPipeline);
+    gst_rtsp_media_factory_set_launch(factory, stream.pipeline.c_str());
 
     /* notify when our media is ready, This is called whenever someone asks for
      * the media and a new pipeline is created */
-    // Pass `this` as user_data so media_configure can register the media's appsrc on the node
-    g_signal_connect(factory, "media-configure", G_CALLBACK(media_configure), this);
+    // Pass the stream as user_data so media_configure can register the media's appsrc on it
+    g_signal_connect(factory, "media-configure", G_CALLBACK(media_configure), &stream);
 
     gst_rtsp_media_factory_set_shared(factory, TRUE);
 
     /* attach the factory to the url */
-    gst_rtsp_mount_points_add_factory(mounts, url, factory);
+    gst_rtsp_mount_points_add_factory(mounts, stream.mountpoint.c_str(), factory);
 
     /* don't need the ref to the mounts anymore */
     g_object_unref(mounts);
 }
 
 struct MediaCleanupData {
-    Image2rtsp *node = nullptr;
+    Stream *stream = nullptr;
     GstAppSrc *appsrc = nullptr;          // null for a camera pipeline, which has no appsrc
     std::atomic<bool> prepared{false};    // set from the media's "prepared" signal
 };
@@ -107,7 +120,7 @@ void Image2rtsp::media_unprepared(GstRTSPMedia *, gpointer user_data){
      * Do not call gst_rtsp_media_get_status() here: it blocks while the media is still
      * preparing, which deadlocks preparation and makes every client fail. */
     if (!data->prepared){
-        RCLCPP_ERROR(data->node->get_logger(),
+        RCLCPP_ERROR(data->stream->logger,
                      "RTSP media failed to start, the client was refused with 503. "
                      "Check the source: camera busy or disconnected, or a framerate the "
                      "source cannot deliver. Run with GST_DEBUG=2 for the GStreamer detail");
@@ -115,8 +128,8 @@ void Image2rtsp::media_unprepared(GstRTSPMedia *, gpointer user_data){
 
     if (data->appsrc){
         {
-            std::lock_guard<std::mutex> lock(data->node->appsrc_mutex);
-            auto &list = data->node->appsrc_list;
+            std::lock_guard<std::mutex> lock(data->stream->appsrc_mutex);
+            auto &list = data->stream->appsrc_list;
             list.erase(std::remove(list.begin(), list.end(), data->appsrc), list.end());
         }
         gst_object_unref(data->appsrc);
@@ -125,14 +138,14 @@ void Image2rtsp::media_unprepared(GstRTSPMedia *, gpointer user_data){
 }
 
 void Image2rtsp::media_configure(GstRTSPMediaFactory *, GstRTSPMedia *media, gpointer user_data){
-    Image2rtsp *node = static_cast<Image2rtsp*>(user_data);
+    Stream *stream = static_cast<Stream*>(user_data);
     GstElement *pipeline = gst_rtsp_media_get_element(media);
     GstElement *imagesrc = gst_bin_get_by_name(GST_BIN(pipeline), "imagesrc");
     gst_object_unref(pipeline);
 
     /* Every media reports failure through "unprepared", appsrc and camera alike. */
     auto *cleanup = new MediaCleanupData();
-    cleanup->node = node;
+    cleanup->stream = stream;
     g_signal_connect(media, "prepared", G_CALLBACK(media_prepared), cleanup);
     g_signal_connect(media, "unprepared", G_CALLBACK(media_unprepared), cleanup);
 
@@ -151,15 +164,15 @@ void Image2rtsp::media_configure(GstRTSPMediaFactory *, GstRTSPMedia *media, gpo
 #endif
 
         {
-            std::lock_guard<std::mutex> lock(node->appsrc_mutex);
-            node->appsrc_list.push_back(appsrc);
+            std::lock_guard<std::mutex> lock(stream->appsrc_mutex);
+            stream->appsrc_list.push_back(appsrc);
         }
 
         cleanup->appsrc = appsrc;
     }
 }
 
-const ImageFormat *Image2rtsp::format_from_encoding(const sensor_msgs::msg::Image &msg){
+const ImageFormat *format_from_encoding(const rclcpp::Logger &logger, const sensor_msgs::msg::Image &msg){
     // ROS encoding -> GStreamer video/x-raw format (https://gstreamer.freedesktop.org/documentation/video/video-format.html)
     namespace enc = sensor_msgs::image_encodings;
     static const std::map<std::string, ImageFormat> known_formats = {
@@ -184,19 +197,19 @@ const ImageFormat *Image2rtsp::format_from_encoding(const sensor_msgs::msg::Imag
     };
 
     if (msg.is_bigendian){
-        RCLCPP_ERROR(this->get_logger(), "GST: big endian image format is not supported");
+        RCLCPP_ERROR(logger, "GST: big endian image format is not supported");
         return nullptr;
     }
 
     auto format = known_formats.find(msg.encoding);
     if (format == known_formats.end()){
-        RCLCPP_ERROR(this->get_logger(), "GST: image format '%s' unknown", msg.encoding.c_str());
+        RCLCPP_ERROR(logger, "GST: image format '%s' unknown", msg.encoding.c_str());
         return nullptr;
     }
     return &format->second;
 }
 
-GstCaps *Image2rtsp::caps_for(const char *gst_format, int width, int height){
+GstCaps *Stream::caps_for(const char *gst_format, int width, int height){
     if (!caps || caps_format != gst_format || caps_width != width || caps_height != height){
         if (caps) gst_caps_unref(caps);
         caps = gst_caps_new_simple("video/x-raw",
@@ -223,7 +236,7 @@ static GstBuffer *wrap_buffer(const void *data, size_t size, Holder *holder){
 }
 
 /* Hand one frame to every prepared media. Takes ownership of buf. Call with appsrc_mutex held. */
-void Image2rtsp::push_frame(GstBuffer *buf, GstCaps *frame_caps){
+void Stream::push_frame(GstBuffer *buf, GstCaps *frame_caps){
     for (GstAppSrc *appsrc : appsrc_list){
         gst_app_src_set_caps(appsrc, frame_caps);
         gst_app_src_push_buffer(appsrc, gst_buffer_ref(buf));
@@ -233,26 +246,24 @@ void Image2rtsp::push_frame(GstBuffer *buf, GstCaps *frame_caps){
 
 gboolean Image2rtsp::session_cleanup(gpointer user_data){
     Image2rtsp *node = static_cast<Image2rtsp*>(user_data);
-    GstRTSPServer *server = node->rtsp_server;
-    GstRTSPSessionPool *pool;
-    int num;
+    for (auto &entry : node->servers){
+        GstRTSPSessionPool *pool = gst_rtsp_server_get_session_pool(entry.second.server);
+        int num = gst_rtsp_session_pool_cleanup(pool);
+        g_object_unref(pool);
 
-    pool = gst_rtsp_server_get_session_pool(server);
-    num = gst_rtsp_session_pool_cleanup(pool);
-    g_object_unref(pool);
-
-    if (num > 0){
-        RCLCPP_DEBUG(node->get_logger(), "Sessions cleaned: %d", num);
+        if (num > 0){
+            RCLCPP_DEBUG(node->get_logger(), "Sessions cleaned on port %s: %d", entry.first.c_str(), num);
+        }
     }
     return TRUE;
 }
 
-void Image2rtsp::topic_callback(const sensor_msgs::msg::Image::SharedPtr msg){
+void Stream::topic_callback(const sensor_msgs::msg::Image::SharedPtr msg){
     std::lock_guard<std::mutex> lock(appsrc_mutex);
     if (appsrc_list.empty()) return;
 
-    RCLCPP_DEBUG(this->get_logger(), "Received image %dx%d, encoding=%s", msg->width, msg->height, msg->encoding.c_str());
-    const ImageFormat *format = format_from_encoding(*msg);
+    RCLCPP_DEBUG(logger, "Received image %dx%d, encoding=%s", msg->width, msg->height, msg->encoding.c_str());
+    const ImageFormat *format = format_from_encoding(logger, *msg);
     if (!format) return;
 
     GstBuffer *buf;
@@ -268,13 +279,13 @@ void Image2rtsp::topic_callback(const sensor_msgs::msg::Image::SharedPtr msg){
     push_frame(buf, caps_for(format->gst, msg->width, msg->height));
 }
 
-void Image2rtsp::compressed_topic_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg){
+void Stream::compressed_topic_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg){
     std::lock_guard<std::mutex> lock(appsrc_mutex);
     if (appsrc_list.empty()) return;
 
     auto *img = new cv::Mat(cv::imdecode(cv::Mat(msg->data), cv::IMREAD_UNCHANGED));
     if (img->empty()){
-        RCLCPP_ERROR(this->get_logger(), "Failed to decompress image");
+        RCLCPP_ERROR(logger, "Failed to decompress image");
         delete img;
         return;
     }
@@ -286,7 +297,7 @@ void Image2rtsp::compressed_topic_callback(const sensor_msgs::msg::CompressedIma
         case CV_8UC4: gst_format = "BGRA"; break;
         case CV_8UC1: gst_format = "GRAY8"; break;
         default:
-            RCLCPP_ERROR(this->get_logger(), "Unsupported decoded image type (depth %d, %d channels) for format '%s'", img->depth(), img->channels(), msg->format.c_str());
+            RCLCPP_ERROR(logger, "Unsupported decoded image type (depth %d, %d channels) for format '%s'", img->depth(), img->channels(), msg->format.c_str());
             delete img;
             return;
     }

@@ -41,67 +41,125 @@ Image2rtsp::Image2rtsp() : Node("image2rtsp"){
                                                     rtph264pay name=pay0 pt=96 )
                                                     )");
 
-    topic               = this->get_parameter("topic").as_string();
-    mountpoint          = this->get_parameter("mountpoint").as_string();
-    port                = this->get_parameter("port").as_string();
-    local_only          = this->get_parameter("local_only").as_bool();
-    camera              = this->get_parameter("camera").as_bool();
-    compressed          = this->get_parameter("compressed").as_bool();
-    default_pipeline    = this->get_parameter("default_pipeline").as_string();
-    camera_pipeline     = this->get_parameter("camera_pipeline").as_string();
-
-    // Start the subscription
-    if (camera == false){
-        if (compressed == false){
-            subscription_ = this->create_subscription<sensor_msgs::msg::Image>(topic, 10, std::bind(&Image2rtsp::topic_callback, this, _1));
-            RCLCPP_INFO(this->get_logger(), "Subscribing to sensor_msgs::msg::Image");
+    // Several streams in one process: a list of names, each configured by `<name>.topic`,
+    // `<name>.mountpoint` etc., which default to the parameters above. Without it, the
+    // parameters above are the one stream.
+    auto names = this->declare_parameter("streams", std::vector<std::string>{});
+    if (names.empty()){
+        streams.push_back(stream_from_parameters(""));
+    }
+    for (const auto &name : names){
+        if (name.empty() || name.find_first_of(". ") != std::string::npos){
+            throw std::runtime_error("Invalid stream name '" + name + "' in streams");
         }
-        else {
-            subscription_compressed_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(topic, 10, std::bind(&Image2rtsp::compressed_topic_callback, this, _1));
-            RCLCPP_INFO(this->get_logger(), "Subscribing to sensor_msgs::msg::CompressedImage");
+        for (const auto &other : streams){
+            if (other->name == name) throw std::runtime_error("Stream '" + name + "' is listed twice in streams");
+        }
+        streams.push_back(stream_from_parameters(name));
+    }
+
+    // The streams on one port share one RTSP server, so they need distinct mountpoints and the same local_only
+    for (size_t i = 0; i < streams.size(); i++){
+        for (size_t j = 0; j < i; j++){
+            const Stream &a = *streams[j], &b = *streams[i];
+            if (a.port != b.port) continue;
+            if (a.mountpoint == b.mountpoint){
+                throw std::runtime_error("Streams '" + a.name + "' and '" + b.name + "' both serve " + a.port + a.mountpoint);
+            }
+            if (a.local_only != b.local_only){
+                throw std::runtime_error("Streams '" + a.name + "' and '" + b.name + "' share port " + a.port + " but not local_only");
+            }
         }
     }
 
-    // Set up the RTSP server. The GStreamer main loop thread is started last, so a
-    // failure here (e.g. the port is in use) can still be reported by throwing.
+    // Start the subscriptions
+    for (auto &stream : streams) subscribe(*stream);
+
+    // Set up the RTSP servers. The GStreamer main loop thread is started last, so a
+    // failure here (e.g. a port is in use) can still be reported by throwing.
     gst_init(NULL, NULL);
 
     // With a camera source nothing touches the device until the first client sends
     // DESCRIBE, so a busy or missing device used to surface only as a 503 on the
     // client with no trace in the ROS log. Check it up front and refuse to start.
-    if (camera){
-        std::string device = extract_device(camera_pipeline);
+    for (auto &stream : streams){
+        if (!stream->camera) continue;
+        std::string device = extract_device(stream->pipeline);
         if (device.empty()){
-            RCLCPP_WARN(this->get_logger(), "camera is true but camera_pipeline has no 'device=': skipping the device check");
+            RCLCPP_WARN(stream->logger, "camera is true but camera_pipeline has no 'device=': skipping the device check");
         } else {
-            RCLCPP_INFO(this->get_logger(), "Checking camera device %s", device.c_str());
-            probe_camera_device(device);
-            RCLCPP_INFO(this->get_logger(), "Camera device %s is available", device.c_str());
+            RCLCPP_INFO(stream->logger, "Checking camera device %s", device.c_str());
+            probe_camera_device(stream->logger, device);
+            RCLCPP_INFO(stream->logger, "Camera device %s is available", device.c_str());
         }
     }
 
-    rtsp_server = rtsp_server_create(port, local_only);
-
-    pipeline = camera ? camera_pipeline : default_pipeline;
-    framerate = extract_framerate(pipeline, 30);
-    rtsp_server_add_url(mountpoint.c_str(), pipeline.c_str());
+    for (auto &stream : streams){
+        rtsp_server_add_url(rtsp_server_for(stream->port, stream->local_only), *stream);
+    }
+    /* periodically remove expired sessions */
+    cleanup_source_id = g_timeout_add_seconds(2, session_cleanup, this);
     video_mainloop_start();
 
-    gchar *server_address = gst_rtsp_server_get_address(rtsp_server);
-    if (local_only) {
-        RCLCPP_INFO(this->get_logger(), "Stream available at rtsp://%s:%s%s", server_address, port.c_str(), mountpoint.c_str());
+    for (auto &stream : streams) log_stream_address(*stream);
+}
+
+/* The stream `name` from its `<name>.` parameters, or with an empty name the stream of the top-level ones. */
+std::unique_ptr<Stream> Image2rtsp::stream_from_parameters(const std::string &name){
+    auto stream = std::make_unique<Stream>(name.empty() ? this->get_logger() : this->get_logger().get_child(name));
+    stream->name = name;
+
+    // value: the top-level parameter, which is the stream's own default
+    auto get = [&](const std::string &key, auto value){
+        using T = decltype(value);
+        return name.empty() ? value : this->declare_parameter<T>(name + "." + key, value);
+    };
+    stream->topic       = get("topic",      this->get_parameter("topic").as_string());
+    stream->mountpoint  = get("mountpoint", this->get_parameter("mountpoint").as_string());
+    stream->port        = get("port",       this->get_parameter("port").as_string());
+    stream->local_only  = get("local_only", this->get_parameter("local_only").as_bool());
+    stream->camera      = get("camera",     this->get_parameter("camera").as_bool());
+    stream->compressed  = get("compressed", this->get_parameter("compressed").as_bool());
+    std::string default_pipeline = get("default_pipeline", this->get_parameter("default_pipeline").as_string());
+    std::string camera_pipeline  = get("camera_pipeline",  this->get_parameter("camera_pipeline").as_string());
+
+    stream->pipeline = stream->camera ? camera_pipeline : default_pipeline;
+    stream->framerate = extract_framerate(stream->logger, stream->pipeline, 30);
+    return stream;
+}
+
+void Image2rtsp::subscribe(Stream &stream){
+    if (stream.camera) return;
+    /* Each stream's callbacks run one at a time, but in parallel with the other streams' under a multi-threaded executor */
+    stream.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = stream.callback_group;
+    if (stream.compressed == false){
+        stream.subscription_ = this->create_subscription<sensor_msgs::msg::Image>(stream.topic, 10, std::bind(&Stream::topic_callback, &stream, _1), options);
+        RCLCPP_INFO(stream.logger, "Subscribing to sensor_msgs::msg::Image");
+    }
+    else {
+        stream.subscription_compressed_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(stream.topic, 10, std::bind(&Stream::compressed_topic_callback, &stream, _1), options);
+        RCLCPP_INFO(stream.logger, "Subscribing to sensor_msgs::msg::CompressedImage");
+    }
+}
+
+void Image2rtsp::log_stream_address(const Stream &stream){
+    gchar *server_address = gst_rtsp_server_get_address(servers.at(stream.port).server);
+    if (stream.local_only) {
+        RCLCPP_INFO(stream.logger, "Stream available at rtsp://%s:%s%s", server_address, stream.port.c_str(), stream.mountpoint.c_str());
     } else {
-        RCLCPP_INFO(this->get_logger(), "RTSP server bound to %s:%s%s", server_address, port.c_str(), mountpoint.c_str());
-        RCLCPP_INFO(this->get_logger(), "Connect clients using rtsp://<host-ip>:%s%s (0.0.0.0 is bind-only)", port.c_str(), mountpoint.c_str());
+        RCLCPP_INFO(stream.logger, "RTSP server bound to %s:%s%s", server_address, stream.port.c_str(), stream.mountpoint.c_str());
+        RCLCPP_INFO(stream.logger, "Connect clients using rtsp://<host-ip>:%s%s (0.0.0.0 is bind-only)", stream.port.c_str(), stream.mountpoint.c_str());
     }
     g_free(server_address);
 }
 
-unsigned int Image2rtsp::extract_framerate(const std::string& pipeline, unsigned int default_framerate) {
+unsigned int extract_framerate(const rclcpp::Logger &logger, const std::string& pipeline, unsigned int default_framerate) {
     std::string search_str = "framerate=";
     size_t pos = pipeline.find(search_str);
     if (pos == std::string::npos) {
-        RCLCPP_WARN(this->get_logger(), "Framerate not found in pipeline, using default: %u", default_framerate);
+        RCLCPP_WARN(logger, "Framerate not found in pipeline, using default: %u", default_framerate);
         return default_framerate;
     }
 
@@ -109,7 +167,7 @@ unsigned int Image2rtsp::extract_framerate(const std::string& pipeline, unsigned
 
     size_t end_pos = pipeline.find_first_of("/,", pos);
     if (end_pos == std::string::npos) {
-        RCLCPP_WARN(this->get_logger(), "Invalid framerate format in pipeline, using default: %u", default_framerate);
+        RCLCPP_WARN(logger, "Invalid framerate format in pipeline, using default: %u", default_framerate);
         return default_framerate;
     }
 
@@ -121,19 +179,19 @@ unsigned int Image2rtsp::extract_framerate(const std::string& pipeline, unsigned
     try {
         int framerate = std::stoi(framerate_str);
         if (framerate <= 0) {
-            RCLCPP_WARN(this->get_logger(), "Invalid framerate value %d, using default: %u", framerate, default_framerate);
+            RCLCPP_WARN(logger, "Invalid framerate value %d, using default: %u", framerate, default_framerate);
             return default_framerate;
         }
-        RCLCPP_INFO(this->get_logger(), "Using set framerate %d", framerate);
+        RCLCPP_INFO(logger, "Using set framerate %d", framerate);
         return static_cast<unsigned int>(framerate);
     } catch (const std::exception& e) {
-        RCLCPP_WARN(this->get_logger(), "Failed to parse framerate '%s', using default: %u", framerate_str.c_str(), default_framerate);
+        RCLCPP_WARN(logger, "Failed to parse framerate '%s', using default: %u", framerate_str.c_str(), default_framerate);
         return default_framerate;
     }
 }
 
 /* Pull the "device=..." value out of a gst-launch pipeline description. */
-std::string Image2rtsp::extract_device(const std::string &pipeline){
+std::string extract_device(const std::string &pipeline){
     const std::string key = "device=";
     size_t pos = pipeline.find(key);
     if (pos == std::string::npos) return "";
@@ -149,7 +207,7 @@ std::string Image2rtsp::extract_device(const std::string &pipeline){
 /* Grab a single frame from the device so that an unusable camera (busy, missing, or
  * without a usable format) stops the node instead of failing silently per client.
  * Throws std::runtime_error, which main() turns into a FATAL log and exit code 1. */
-void Image2rtsp::probe_camera_device(const std::string &device){
+void probe_camera_device(const rclcpp::Logger &logger, const std::string &device){
     std::string desc = "v4l2src device=" + device + " num-buffers=1 ! fakesink sync=false";
     GError *parse_error = nullptr;
     GstElement *probe = gst_parse_launch(desc.c_str(), &parse_error);
@@ -184,7 +242,7 @@ void Image2rtsp::probe_camera_device(const std::string &device){
     /* A timeout is ambiguous (a slow camera looks the same as a stuck one), so warn
      * rather than refuse to start; a reported error is definitive and is fatal. */
     if (timed_out){
-        RCLCPP_WARN(this->get_logger(), "No frame from %s within 5 s; starting anyway, the stream may not work", device.c_str());
+        RCLCPP_WARN(logger, "No frame from %s within 5 s; starting anyway, the stream may not work", device.c_str());
     }
     if (!failure.empty()) throw std::runtime_error(failure);
 }
@@ -202,7 +260,15 @@ int main(int argc, char *argv[]){
     int rc = 0;
     try {
         auto node = std::make_shared<Image2rtsp>();
-        rclcpp::spin(node);
+        if (node->stream_count() > 1){
+            // A thread per stream, as with a process per stream: each stream's callbacks
+            // stay in order in its own callback group, and no stream waits for another's.
+            rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), node->stream_count());
+            executor.add_node(node);
+            executor.spin();
+        } else {
+            rclcpp::spin(node);
+        }
     } catch (const std::exception &e) {
         RCLCPP_FATAL(rclcpp::get_logger("image2rtsp"), "%s", e.what());
         rc = 1;
